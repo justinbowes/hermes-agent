@@ -30,6 +30,10 @@ class TestIsUnusableContainerCwd:
     def test_posix_home_host_path_rejected(self):
         assert tt._is_unusable_container_cwd("/home/ben/projects") is True
 
+    def test_fedora_ostree_home_host_path_rejected(self):
+        """Fedora Atomic desktops expose user homes below /var/home."""
+        assert tt._is_unusable_container_cwd("/var/home/justin/projects") is True
+
 
     def test_container_backends_set(self):
         assert tt._CONTAINER_BACKENDS == frozenset(
@@ -104,6 +108,13 @@ class TestOverrideCwdSanitizedAtCallSite:
         cwd = self._run_and_capture_cwd(monkeypatch, r"C:\Users\someuser")
         assert cwd == "/root", (
             f"Host-path cwd override leaked to the container builder: {cwd!r}. "
+            "It must be sanitized back to config['cwd']."
+        )
+
+    def test_fedora_ostree_host_override_does_not_reach_container(self, monkeypatch):
+        cwd = self._run_and_capture_cwd(monkeypatch, "/var/home/justin/projects")
+        assert cwd == "/root", (
+            f"Fedora host-path cwd override leaked to the container builder: {cwd!r}. "
             "It must be sanitized back to config['cwd']."
         )
 
