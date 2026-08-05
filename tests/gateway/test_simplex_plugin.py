@@ -161,6 +161,27 @@ async def test_send_group():
     assert result.success is True
 
 
+@pytest.mark.asyncio
+async def test_send_dm_uses_structured_numeric_contact_id():
+    """Gateway MessageSource chat IDs are numeric SimpleX contact IDs."""
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._ws = AsyncMock()
+
+    result = await adapter.send("3", "pairing code")
+
+    payload = json.loads(adapter._ws.send.call_args[0][0])
+    assert payload["cmd"].startswith("/_send @3 json ")
+    msg_content = json.loads(payload["cmd"].split(" json ", 1)[1])[0][
+        "msgContent"
+    ]
+    assert msg_content == {"type": "text", "text": "pairing code"}
+    assert result.success is True
+
+
 # ---------------------------------------------------------------------------
 # 7b. Channel directory enumeration (list_channels)
 # ---------------------------------------------------------------------------
@@ -230,6 +251,28 @@ async def test_list_channels_returns_none_on_contacts_timeout():
 # ---------------------------------------------------------------------------
 # 8. Inbound: filter own-echo by corrId prefix
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_contact_request_auto_accept_uses_websocket_api_command():
+    """Contact request IDs require the API form, not display-name /accept."""
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock()
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "contactRequest",
+                "contactRequest": {"contactRequestId": 42},
+            }
+        }
+    )
+
+    adapter._send_command.assert_awaited_once_with("/_accept 42")
 
 
 # ---------------------------------------------------------------------------

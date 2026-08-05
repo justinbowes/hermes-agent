@@ -400,7 +400,10 @@ class SimplexAdapter(BasePlatformAdapter):
                     "SimpleX: auto-accepting contact request %s",
                     _redact_id(str(contact_req_id)),
                 )
-                await self._send_command(f"/accept {contact_req_id}")
+                # The WebSocket API accepts request IDs via ``/_accept``.
+                # Interactive ``/accept`` expects a display name (``@name``),
+                # so passing a numeric request ID there discards the command.
+                await self._send_command(f"/_accept {contact_req_id}")
             return
 
         # Early file-descriptor ready: simplex fires this before newChatItems
@@ -830,15 +833,15 @@ class SimplexAdapter(BasePlatformAdapter):
 
         if content:
             corr_id = self._make_corr_id()
-            if chat_id.startswith("group:"):
-                # Structured form: addresses by numeric ID, and json.dumps
-                # escapes newlines + special chars correctly.
-                composed = json.dumps(
-                    [{"msgContent": {"type": "text", "text": content}}]
-                )
-                cmd_str = f"/_send #{chat_id[6:]} json {composed}"
-            else:
-                cmd_str = f"@{chat_id} {content}"
+            # Structured form addresses both groups and direct contacts by
+            # numeric ID. Gateway MessageSource.chat_id is the contactId, not
+            # a display name, so interactive ``@3 text`` silently misses a
+            # contact named "Justin". JSON also preserves newlines safely.
+            composed = json.dumps(
+                [{"msgContent": {"type": "text", "text": content}}]
+            )
+            target = f"#{chat_id[6:]}" if chat_id.startswith("group:") else f"@{chat_id}"
+            cmd_str = f"/_send {target} json {composed}"
 
             await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
 
