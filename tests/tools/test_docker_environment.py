@@ -101,6 +101,73 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert f"{project_dir}:/workspace" in run_args_str
 
 
+def test_auto_mount_host_cwd_adds_selinux_shared_relabel(monkeypatch, tmp_path):
+    """The cwd stays usable by concurrent Hermes containers under SELinux."""
+    project_dir = tmp_path / "my-project"
+    project_dir.mkdir()
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+    )
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    assert f"{project_dir}:/workspace:z" in run_calls[0][0]
+
+
+def test_nested_workspace_volume_does_not_suppress_cwd_mount(monkeypatch, tmp_path):
+    """A /workspace/projects mount is not an explicit /workspace mount."""
+    project_dir = tmp_path / "cwd-project"
+    project_dir.mkdir()
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        volumes=[f"{projects_dir}:/workspace/projects:Z"],
+    )
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+    assert f"{project_dir}:/workspace:z" in run_args
+    assert f"{projects_dir}:/workspace/projects:Z" in run_args
+
+
+def test_exact_workspace_volume_suppresses_cwd_mount(monkeypatch, tmp_path):
+    """An explicit /workspace destination remains authoritative."""
+    project_dir = tmp_path / "cwd-project"
+    project_dir.mkdir()
+    explicit_workspace = tmp_path / "explicit-workspace"
+    explicit_workspace.mkdir()
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        volumes=[f"{explicit_workspace}:/workspace:Z"],
+    )
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+    assert f"{explicit_workspace}:/workspace:Z" in run_args
+    assert f"{project_dir}:/workspace:z" not in run_args
+
+
 def test_non_persistent_cleanup_removes_container(monkeypatch):
     """When persist_across_processes=false, cleanup() must docker stop AND
     docker rm so containers don't leak across hermes processes.

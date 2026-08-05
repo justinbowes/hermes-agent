@@ -940,7 +940,12 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if ":" in vol:
                 volume_args.extend(["-v", vol])
-                if ":/workspace" in vol:
+                # Only an exact /workspace destination is authoritative.
+                # Nested mounts such as /workspace/projects must coexist with
+                # the automatic host-cwd bind mounted at /workspace.
+                parts = vol.rsplit(":", 2)
+                destination = parts[-2] if len(parts) == 3 else parts[-1]
+                if destination == "/workspace":
                     workspace_explicitly_mounted = True
             else:
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
@@ -983,7 +988,10 @@ class DockerEnvironment(BaseEnvironment):
 
         if bind_host_cwd:
             logger.info("Mounting configured host cwd to /workspace: %s", host_cwd_abs)
-            volume_args = ["-v", f"{host_cwd_abs}:/workspace", *volume_args]
+            # A shared SELinux relabel is required because the TUI, gateway,
+            # and subagents may mount the same cwd in concurrent containers.
+            # A private :Z relabel lets the newest container lock out the rest.
+            volume_args = ["-v", f"{host_cwd_abs}:/workspace:z", *volume_args]
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
 
