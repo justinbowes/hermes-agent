@@ -16,6 +16,7 @@ from tools.computer_use import cua_backend
 
 
 _VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
+_WAYLAND_VAR = "CUA_DRIVER_RS_ENABLE_WAYLAND"
 
 
 class TestTelemetryDisabledFlag:
@@ -49,4 +50,16 @@ class TestChildEnv:
         with patch.object(cua_backend, "_cua_telemetry_disabled", return_value=True):
             env = cua_backend.cua_driver_child_env({_VAR: "1"})
             assert env[_VAR] == "0"
+
+    def test_wayland_opt_in_injects_driver_flag(self):
+        with patch("hermes_cli.config.load_config",
+                   return_value={"computer_use": {"wayland": True}}):
+            env = cua_backend.cua_driver_child_env({"PATH": "/usr/bin"})
+            assert env[_WAYLAND_VAR] == "1"
+
+    def test_wayland_default_does_not_override_parent_env(self):
+        with patch("hermes_cli.config.load_config",
+                   return_value={"computer_use": {}}):
+            env = cua_backend.cua_driver_child_env({_WAYLAND_VAR: "0"})
+            assert env[_WAYLAND_VAR] == "0"
 

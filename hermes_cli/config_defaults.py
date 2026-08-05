@@ -2982,6 +2982,10 @@ DEFAULT_CONFIG = {
         # every invocation (MCP backend, status, doctor, install). Set true
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
+        # Enable cua-driver's experimental native Wayland backend. Off by
+        # default upstream; without it a Wayland session exposes only XWayland
+        # application windows. Hermes passes the opt-in to every driver spawn.
+        "wayland": False,
         # Cap driver screenshot longest edge (pixels) via set_config on
         # session start. Shrinks SOM multimodal payloads; 0 disables.
         "max_image_dimension": 1456,
