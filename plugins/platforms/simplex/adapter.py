@@ -838,7 +838,16 @@ class SimplexAdapter(BasePlatformAdapter):
                 )
                 cmd_str = f"/_send #{chat_id[6:]} json {composed}"
             else:
-                cmd_str = f"@{chat_id} {content}"
+                # DMs: use the structured /_send form addressing by numeric
+                # contactId. The bare "@<id> text" form makes the daemon do a
+                # display-name lookup for a contact literally named "<id>",
+                # which returns contactNotFound and silently drops the message
+                # whenever chat_id is the numeric contactId (the gateway send
+                # path). Mirror the group branch. (fork-local fix; report upstream)
+                composed = json.dumps(
+                    [{"msgContent": {"type": "text", "text": content}}]
+                )
+                cmd_str = f"/_send @{chat_id} json {composed}"
 
             await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
 
