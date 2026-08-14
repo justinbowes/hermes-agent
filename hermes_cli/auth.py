@@ -217,6 +217,17 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("LM_API_KEY",),
         base_url_env_var="LM_BASE_URL",
     ),
+    "litellm": ProviderConfig(
+        id="litellm",
+        name="LiteLLM Proxy",
+        auth_type="api_key",
+        # Intentionally empty: LiteLLM is always self/team-hosted, so setup must
+        # prompt for the URL rather than silently use a wrong default.
+        inference_base_url="",
+        # Optional master key; many deployments run with no auth or a team key.
+        api_key_env_vars=("LITELLM_API_KEY",),
+        base_url_env_var="LITELLM_BASE_URL",
+    ),
     "copilot": ProviderConfig(
         id="copilot",
         name="GitHub Copilot",

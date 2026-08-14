@@ -3229,6 +3229,22 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "LITELLM_API_KEY": {
+        "description": "API key for LiteLLM proxy (leave blank if auth is disabled)",
+        "prompt": "LiteLLM API key",
+        "url": "https://docs.litellm.ai/docs/proxy/virtual_keys",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "LITELLM_BASE_URL": {
+        "description": "LiteLLM proxy base URL",
+        "prompt": "LiteLLM proxy base URL (e.g. https://llm.example.com/v1)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
     "GLM_API_KEY": {
         "description": "Z.AI / GLM API key (also recognized as ZAI_API_KEY / Z_AI_API_KEY)",
         "prompt": "Z.AI / GLM API key",

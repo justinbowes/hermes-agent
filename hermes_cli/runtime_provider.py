@@ -437,6 +437,79 @@ def _maybe_apply_codex_app_server_runtime(
     return api_mode
 
 
+def _litellm_model_api_mode(model: str, model_cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve the api_mode for a model routed through a LiteLLM proxy.
+
+    LiteLLM is a multiplexer: the wire format is a property of the TARGET
+    MODEL family, not the endpoint. Claude models must go on the native
+    Anthropic Messages wire (``anthropic_messages``) so prompt caching engages
+    via anthropic_prompt_cache_policy; everything else (GPT, Gemini, Qwen, …)
+    takes the OpenAI-compatible ``chat_completions`` wire.
+
+    An explicit ``model.api_mode`` in config is honored as an escape hatch —
+    the same override the anthropic/azure-foundry branches respect.
+    """
+    explicit = _parse_api_mode((model_cfg or {}).get("api_mode"))
+    if explicit:
+        return explicit
+    model_lower = (model or "").lower()
+    if "claude" in model_lower:
+        return "anthropic_messages"
+    return "chat_completions"
+
+
+def _litellm_base_url_from_config(model_cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve the LiteLLM proxy base URL from config.yaml.
+
+    LiteLLM is a *provider*, not a model: one self/team-hosted URL fronts many
+    model families. Its base URL therefore belongs in a ``providers.litellm``
+    block (a non-secret setting → config.yaml, per the .env-is-secrets-only
+    policy), NOT smuggled through the ``LITELLM_BASE_URL`` env var the borrowed
+    API-key-provider machinery would otherwise force.
+
+    The reserved provider name ``litellm`` shadows ``_get_named_custom_provider``
+    (a first-class provider can't be a "named custom" one), so that block would
+    be silently dropped without this explicit read. Resolution order, first
+    non-empty wins:
+
+      1. ``providers.litellm.{base_url,api,url}``  (canonical, config.yaml)
+      2. ``model.base_url``  (honored only when ``model.provider == litellm``)
+      3. ``LITELLM_BASE_URL`` env var  (back-compat / ephemeral override)
+
+    Returns a URL with any trailing slash stripped, or "" when nothing is set.
+    """
+    cfg = model_cfg if model_cfg is not None else _get_model_config()
+
+    # (1) providers.litellm block — the canonical home.
+    try:
+        full_config = load_config()
+    except Exception:
+        full_config = {}
+    providers = full_config.get("providers")
+    if isinstance(providers, dict):
+        from hermes_cli.config import is_provider_enabled
+        entry = providers.get("litellm")
+        if isinstance(entry, dict) and is_provider_enabled(entry):
+            block_url = (
+                entry.get("base_url") or entry.get("api") or entry.get("url") or ""
+            )
+            block_url = str(block_url or "").strip().rstrip("/")
+            if block_url:
+                return block_url
+
+    # (2) model.base_url, but only when the configured provider IS litellm —
+    #     mirrors the anthropic/azure-foundry branches.
+    cfg_provider = str((cfg or {}).get("provider") or "").strip().lower()
+    if cfg_provider == "litellm":
+        cfg_base_url = str((cfg or {}).get("base_url") or "").strip().rstrip("/")
+        if cfg_base_url:
+            return cfg_base_url
+
+    # (3) LITELLM_BASE_URL env — back-compat only.
+    env_url = _getenv("LITELLM_BASE_URL", "").strip().rstrip("/")
+    return env_url
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -523,6 +596,29 @@ def _resolve_runtime_from_pool_entry(
             if inferred:
                 api_mode = inferred
         # For Anthropic-style endpoints, strip /v1 suffix
+        if api_mode == "anthropic_messages":
+            base_url = re.sub(r"/v1/?$", "", base_url)
+    elif provider == "litellm":
+        # First-class LiteLLM proxy: a multiplexer fronting many model
+        # families behind one /v1 URL. api_mode is a property of the TARGET
+        # model, not the endpoint — Claude → native Anthropic wire (so prompt
+        # caching engages), everything else → OpenAI-compatible wire. An
+        # explicit model.api_mode is honored inside the helper as an escape
+        # hatch. This replaces the old custom-provider footgun where api_mode
+        # had to live in the provider block and every model.* edit was inert.
+        api_mode = _litellm_model_api_mode(effective_model, model_cfg)
+        # Resolve the proxy base URL from config.yaml (providers.litellm block →
+        # model.base_url → LITELLM_BASE_URL env). LiteLLM is a provider, so its
+        # URL lives in the provider block; the reserved name would otherwise be
+        # dropped by _get_named_custom_provider. Only override a pool-supplied
+        # URL when config actually names one, so pooled endpoints still win when
+        # config is silent.
+        cfg_base_url = _litellm_base_url_from_config(model_cfg)
+        if cfg_base_url:
+            base_url = cfg_base_url
+        # For Anthropic-style routing the Anthropic SDK appends its own
+        # /v1/messages, so strip a trailing /v1 the same way the anthropic and
+        # azure-foundry branches do.
         if api_mode == "anthropic_messages":
             base_url = re.sub(r"/v1/?$", "", base_url)
     else:
@@ -2205,6 +2301,29 @@ def resolve_runtime_provider(
             )
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider == "litellm":
+            # LiteLLM multiplexer: api_mode is a property of the TARGET model
+            # family, not the endpoint. Mirror the pool-entry branch in
+            # _resolve_runtime_from_pool_entry so the env-credential path (no
+            # credential pool, just LITELLM_API_KEY in .env — the common
+            # community setup) gets the same per-model routing. Without this,
+            # litellm falls into _fallback_api_mode below and every model,
+            # Claude included, resolves to chat_completions, re-breaking the
+            # prompt-cache footgun this provider exists to fix.
+            api_mode = _litellm_model_api_mode(
+                target_model or model_cfg.get("default", ""), model_cfg
+            )
+            # The registry entry deliberately carries NO default base_url
+            # (LiteLLM is always self/team-hosted), so creds.base_url is empty
+            # here. Resolve it from config.yaml (providers.litellm block →
+            # model.base_url → LITELLM_BASE_URL env). Without this the client
+            # falls through to a default endpoint that rejects the LiteLLM key
+            # with a 401 — the exact bug this branch used to ship.
+            cfg_base_url = _litellm_base_url_from_config(model_cfg)
+            if cfg_base_url:
+                base_url = cfg_base_url
+            if api_mode == "anthropic_messages":
+                base_url = re.sub(r"/v1/?$", "", base_url)
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.
