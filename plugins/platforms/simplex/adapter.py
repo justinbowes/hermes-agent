@@ -5,7 +5,10 @@ Env: SIMPLEX_WS_URL (required; default ws://127.0.0.1:5225) · SIMPLEX_ALLOWED_U
 contactIds — stable across renames, see ``/contacts``) · SIMPLEX_ALLOW_ALL_USERS ·
 SIMPLEX_AUTO_ACCEPT ('false' disables contact-request auto-accept; default true) ·
 SIMPLEX_GROUP_ALLOWED (group IDs or '*'; omit to ignore groups) · SIMPLEX_HOME_CHANNEL[_NAME] ·
-HERMES_SIMPLEX_TEXT_BATCH_DELAY (quiet seconds, default 0.8, merging rapid-fire inbound text).
+HERMES_SIMPLEX_TEXT_BATCH_DELAY (quiet seconds, default 0.8, merging rapid-fire inbound text) ·
+HERMES_SIMPLEX_FILE_RETRY_SECS (seconds before a deferred voice/file transfer is re-requested,
+default 20) · HERMES_SIMPLEX_FILE_TIMEOUT_SECS (seconds before a stranded transfer is abandoned
+and the originating chat notified, default 120).
 ``websockets`` is imported lazily so the plugin stays discoverable when the package is missing.
 """
 
@@ -41,6 +44,11 @@ WS_RETRY_DELAY_INITIAL = 2.0
 WS_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0
 HEALTH_CHECK_STALE_THRESHOLD = 300.0
+# Stranded file-transfer recovery (see _file_transfer_sweeper): a deferred voice note whose
+# rcvFileComplete never arrives otherwise waits forever as a silent black hole.
+FILE_TRANSFER_SWEEP_INTERVAL = 5.0
+FILE_TRANSFER_RETRY_SECS = float(os.getenv("HERMES_SIMPLEX_FILE_RETRY_SECS", "20"))
+FILE_TRANSFER_TIMEOUT_SECS = float(os.getenv("HERMES_SIMPLEX_FILE_TIMEOUT_SECS", "120"))
 _CORR_PREFIX = "hermes-"  # marks requests we sent so our own echoes can be ignored
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".opus"}
@@ -140,7 +148,11 @@ class SimplexAdapter(BasePlatformAdapter):
         self._last_ws_activity = 0.0
         self._pending_corr_ids: set = set()  # cosmetic echo filter: corrIds we minted, bounded
         self._max_pending_corr = 200
-        self._pending_file_transfers: dict[int, dict] = {}  # awaiting rcvFileComplete, by fileId
+        # Deferred file/voice transfers (keyed by fileId). Each value is
+        # {"item": <chat_item>, "first_seen": <ts>, "retries": int}; swept by
+        # _file_transfer_sweeper so a stalled /freceive can't strand a note forever.
+        self._pending_file_transfers: dict[int, dict] = {}
+        self._file_transfer_sweep_task: Optional[asyncio.Task] = None
         self._pending_responses: dict[str, asyncio.Future] = {}  # awaited command replies
         self._corr_counter = 0
         # SimpleX has no client-side split, so the split delay equals the plain one.
@@ -170,6 +182,7 @@ class SimplexAdapter(BasePlatformAdapter):
         self._last_ws_activity = time.time()
         self._ws_task = asyncio.create_task(self._ws_listener())
         self._health_task = asyncio.create_task(self._health_monitor())
+        self._file_transfer_sweep_task = asyncio.create_task(self._file_transfer_sweeper())
         self._mark_connected()
         logger.info("SimpleX: connected to %s", self.ws_url)
         self._wire_plugin_handlers(None)
@@ -179,6 +192,8 @@ class SimplexAdapter(BasePlatformAdapter):
         self._running = False
         await cancel_task(self._ws_task)
         await cancel_task(self._health_task)
+        await cancel_task(self._file_transfer_sweep_task)
+        self._file_transfer_sweep_task = None
         if self._ws:
             with contextlib.suppress(Exception):
                 await self._ws.close()
@@ -240,6 +255,77 @@ class SimplexAdapter(BasePlatformAdapter):
             if elapsed > HEALTH_CHECK_STALE_THRESHOLD:
                 logger.debug("SimpleX: WS application-idle for %.0fs", elapsed)
 
+    # ------------------------------------------------------------------
+    # Stranded file-transfer recovery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _chat_id_from_item(chat_item: dict) -> str:
+        """Re-derive the send-target chat id from a deferred chat item, mirroring
+        the id extraction in ``_handle_chat_item`` so timeout notices reach the
+        originating chat (``group:<id>`` form for groups)."""
+        chat_info = (chat_item or {}).get("chatInfo", {}) or {}
+        chat_type = chat_info.get("type", "")
+        if chat_type == "group":
+            group_id = str((chat_info.get("groupInfo", {}) or {}).get("groupId", ""))
+            return f"group:{group_id}"
+        contact = chat_info.get("contact", {}) or {}
+        return str(contact.get("contactId", ""))
+
+    async def _file_transfer_sweeper(self) -> None:
+        """Recover deferred file/voice transfers that never complete.
+
+        Voice notes can arrive before the daemon has downloaded them so the
+        message is deferred until ``rcvFileComplete``; if that event never
+        arrives (a silently stalled ``/freceive``), the deferred message would
+        wait in ``_pending_file_transfers`` forever. This loop periodically
+        re-issues the receive — ``/fcancel`` first on later attempts, since a
+        stuck receive otherwise just answers ``fileAlreadyReceiving`` — and,
+        past ``FILE_TRANSFER_TIMEOUT_SECS``, evicts the entry and notifies the
+        originating chat instead of silently dropping the voice note.
+        """
+        while self._running:
+            await asyncio.sleep(FILE_TRANSFER_SWEEP_INTERVAL)
+            if not self._running:
+                break
+            await self._sweep_pending_transfers(now=time.time())
+
+    async def _sweep_pending_transfers(self, now: float) -> None:
+        """Run a single recovery pass; extracted for deterministic testing."""
+        for file_id in list(self._pending_file_transfers.keys()):
+            entry = self._pending_file_transfers.get(file_id)
+            if not entry:
+                continue
+            retries = int(entry.get("retries", 0))
+            age = now - float(entry.get("first_seen", now))
+            if age >= FILE_TRANSFER_TIMEOUT_SECS:
+                self._pending_file_transfers.pop(file_id, None)
+                logger.warning(
+                    "SimpleX: file %d transfer timed out after %.0fs; dropping deferred voice message",
+                    file_id, age)
+                try:
+                    chat_id = self._chat_id_from_item(entry.get("item") or {})
+                    if chat_id:
+                        await self.send(
+                            chat_id,
+                            "I couldn't receive your voice note (the download timed out). "
+                            "Could you send it again?")
+                except Exception:
+                    logger.exception("SimpleX: error notifying about timed-out file %d", file_id)
+            elif age >= FILE_TRANSFER_RETRY_SECS:
+                entry["retries"] = retries + 1
+                logger.info(
+                    "SimpleX: file %d still not received after %.0fs — re-issuing (attempt %d)",
+                    file_id, age, retries + 1)
+                try:
+                    if retries >= 1:
+                        # A *stuck* receive answers /freceive with fileAlreadyReceiving forever;
+                        # cancel it first so the re-issue actually starts a fresh transfer.
+                        await self._send_fire_and_forget(f"/fcancel {file_id}")
+                    await self._send_fire_and_forget(f"/freceive {file_id}")
+                except Exception:
+                    logger.exception("SimpleX: error re-issuing receive for file %d", file_id)
+
     async def _handle_event(self, event: dict) -> None:
         # Usually {"corrId": ..., "resp": {"type": ...}}, but some daemons put the
         # response fields at top level — normalize both.
@@ -267,7 +353,10 @@ class SimplexAdapter(BasePlatformAdapter):
         contact_req_id = (resp.get("contactRequest", {}) or {}).get("contactRequestId")
         if contact_req_id is not None:
             logger.info("SimpleX: auto-accepting contact request %s", _redact_id(str(contact_req_id)))
-            await self._send_command(f"/accept {contact_req_id}")
+            # The WS API accepts request IDs via ``/_accept``; the interactive
+            # ``/accept`` expects a display name, so a numeric ID there
+            # silently discards the command.
+            await self._send_command(f"/_accept {contact_req_id}")
 
     async def _on_rcv_file_descr_ready(self, resp: dict) -> None:
         """XFTP files fire this before newChatItems; start the download now, the chat item arrives later."""
@@ -291,7 +380,9 @@ class SimplexAdapter(BasePlatformAdapter):
         file_id = file_info.get("fileId") if isinstance(file_info, dict) else None
         if file_id is None or file_id not in self._pending_file_transfers:
             return
-        pending = self._pending_file_transfers.pop(file_id)
+        entry = self._pending_file_transfers.pop(file_id)
+        # Tolerate the pre-sweeper raw-item shape for safety.
+        pending = entry.get("item", entry) if isinstance(entry, dict) and "item" in entry else entry
         file_source = file_info.get("fileSource", {}) or {}
         file_path = file_source.get("filePath") if isinstance(file_source, dict) else None
         if file_path:
@@ -369,7 +460,8 @@ class SimplexAdapter(BasePlatformAdapter):
             # rcvFileComplete. /freceive gets no corrId reply, so awaiting one would block the loop.
             if not file_path and _is_audio_ext(ext) and file_id is not None:
                 logger.info("SimpleX: voice file %d not yet received, accepting transfer", file_id)
-                self._pending_file_transfers[file_id] = chat_item
+                self._pending_file_transfers[file_id] = {
+                    "item": chat_item, "first_seen": time.time(), "retries": 0}
                 await self._send_fire_and_forget(f"/freceive {file_id}")
                 return
             if file_path:

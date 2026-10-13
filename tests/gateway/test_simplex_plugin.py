@@ -543,3 +543,104 @@ async def test_name_allowlist_warning_once_scoped_even_if_first_connect_fails(mo
     assert len(warnings) == 1
     assert "['alice']" in warnings[0]
     assert "bob" not in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# Stranded file-transfer sweeper (retry + timeout recovery)
+# ---------------------------------------------------------------------------
+
+
+def _make_deferred_item(file_id: int = 9) -> dict:
+    """A direct-chat rcvMsgContent item whose file has NOT landed yet — the
+    shape stored in ``_pending_file_transfers`` when a voice note arrives
+    before the daemon has finished downloading it."""
+    return {
+        "chatInfo": {"type": "direct", "contact": {"contactId": 42}},
+        "chatItem": {
+            "chatDir": {"type": "directRcv"},
+            "meta": {"itemTs": "2026-01-01T00:00:00Z"},
+            "content": {"type": "rcvMsgContent", "msgContent": {"type": "voice", "text": ""}},
+            "file": {"fileId": file_id, "fileName": "note.ogg", "fileSource": {}},
+        },
+    }
+
+
+def _deferred_entry(file_id: int = 9, first_seen: float = 100.0) -> dict:
+    return {"item": _make_deferred_item(file_id), "first_seen": first_seen, "retries": 0}
+
+
+def _sweeper_cmds(adapter) -> list[str]:
+    return [
+        json.loads(c.args[0])["cmd"]
+        for c in adapter._ws.send.call_args_list
+        if c.args
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sweeper_reissues_freceive_after_retry_threshold(monkeypatch):
+    """A transfer waiting past RETRY_SECS (but before timeout) is re-requested;
+    repeat attempts /fcancel first because a stuck receive would only keep
+    answering fileAlreadyReceiving."""
+    adapter = _adapter_with_ws()
+    adapter._running = True
+
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_RETRY_SECS", 10.0)
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_TIMEOUT_SECS", 60.0)
+
+    adapter._pending_file_transfers[9] = _deferred_entry(9, first_seen=100.0)
+
+    # now = 115 -> age 15 (>= retry 10, < timeout 60) => first retry: re-issue only.
+    await adapter._sweep_pending_transfers(now=115.0)
+
+    cmds = _sweeper_cmds(adapter)
+    assert "/freceive 9" in cmds
+    assert not any(cmd.startswith("/fcancel") for cmd in cmds)
+    assert adapter._pending_file_transfers[9]["retries"] == 1
+
+    # now = 130 -> age 30, retries already 1 => cancel then a fresh receive.
+    await adapter._sweep_pending_transfers(now=130.0)
+    cmds2 = _sweeper_cmds(adapter)
+    assert cmds2[-2] == "/fcancel 9"
+    assert cmds2[-1] == "/freceive 9"
+    assert adapter._pending_file_transfers[9]["retries"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sweeper_evicts_and_notifies_on_timeout(monkeypatch):
+    """A transfer past TIMEOUT_SECS is evicted and the originating chat gets a
+    visible notice instead of the voice note vanishing silently."""
+    adapter = _adapter_with_ws()
+    adapter._running = True
+
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_RETRY_SECS", 10.0)
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_TIMEOUT_SECS", 20.0)
+
+    adapter._pending_file_transfers[9] = _deferred_entry(9, first_seen=100.0)
+
+    async def _fake_send(chat_id, content, *args, **kwargs):
+        adapter._last_sent = (chat_id, content)
+
+    monkeypatch.setattr(adapter, "send", _fake_send)
+
+    # now = 130 -> age 30 (>= timeout 20) => evict + notify.
+    await adapter._sweep_pending_transfers(now=130.0)
+
+    assert 9 not in adapter._pending_file_transfers
+    assert adapter._last_sent[0] == "42"
+    assert "voice note" in adapter._last_sent[1]
+
+
+@pytest.mark.asyncio
+async def test_contact_request_auto_accept_uses_websocket_api_command(monkeypatch):
+    """Contact-request IDs require the WS API ``/_accept`` form — the interactive
+    ``/accept`` expects a display name and silently discards numeric IDs."""
+    monkeypatch.delenv("SIMPLEX_AUTO_ACCEPT", raising=False)
+    adapter = _adapter_with_ws()
+    adapter._send_command = AsyncMock()
+
+    await adapter._handle_event(
+        {"resp": {"type": "contactRequest", "contactRequest": {"contactRequestId": 42}}}
+    )
+
+    adapter._send_command.assert_awaited_once_with("/_accept 42")
