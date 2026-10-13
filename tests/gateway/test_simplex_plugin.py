@@ -388,3 +388,97 @@ def _make_file_chat_item(file_path: str, file_name: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 17. Stranded file-transfer sweeper (retry + timeout recovery)
+# ---------------------------------------------------------------------------
+
+
+def _make_deferred_item(file_id: int = 9) -> dict:
+    """A direct-chat rcvMsgContent item whose file has NOT landed yet.
+
+    Mirrors the shape the adapter stores in ``_pending_file_transfers`` when
+    a voice note arrives before the daemon has downloaded it.
+    """
+    return {
+        "chatInfo": {"type": "direct", "contact": {"contactId": 42}},
+        "chatItem": {
+            "chatDir": {"type": "directRcv"},
+            "meta": {"itemTs": "2026-01-01T00:00:00Z"},
+            "content": {
+                "type": "rcvMsgContent",
+                "msgContent": {"type": "voice", "text": ""},
+            },
+            "file": {"fileId": file_id, "fileName": "note.ogg", "fileSource": {}},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_sweeper_reissues_freceive_after_retry_threshold(monkeypatch):
+    """A transfer waiting past RETRY_SECS (but before timeout) re-issues
+    /freceive and bumps the retry counter instead of being dropped."""
+    from gateway.config import PlatformConfig
+
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    adapter._running = True
+    mock_ws = AsyncMock()
+    adapter._ws = mock_ws
+
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_RETRY_SECS", 10)
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_TIMEOUT_SECS", 60)
+
+    adapter._pending_file_transfers[9] = {
+        "item": _make_deferred_item(9),
+        "first_seen": 100.0,
+        "retries": 0,
+    }
+
+    # now = 115 -> age 15 (>= retry 10, < timeout 60) => retry path
+    await adapter._sweep_pending_transfers(now=115.0)
+
+    # The /freceive was re-issued for the stuck file (fire-and-forget).
+    freceive_cmds = [
+        json.loads(c.args[0])["cmd"]
+        for c in mock_ws.send.call_args_list
+        if c.args
+    ]
+    assert any(cmd == "/freceive 9" for cmd in freceive_cmds)
+    # Retry counter incremented; still parked (not yet timed out).
+    assert adapter._pending_file_transfers[9]["retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sweeper_evicts_and_notifies_on_timeout(monkeypatch):
+    """A transfer past TIMEOUT_SECS is evicted and a user-visible notice is
+    sent to the originating chat instead of silently dropping."""
+    from gateway.config import PlatformConfig
+
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    adapter._running = True
+
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_RETRY_SECS", 10)
+    monkeypatch.setattr(_simplex, "FILE_TRANSFER_TIMEOUT_SECS", 20)
+
+    adapter._pending_file_transfers[9] = {
+        "item": _make_deferred_item(9),
+        "first_seen": 100.0,
+        "retries": 0,
+    }
+
+    async def _fake_send(chat_id, content):
+        adapter._last_sent = (chat_id, content)
+
+    monkeypatch.setattr(adapter, "send", _fake_send)
+
+    # now = 130 -> age 30 (>= timeout 20) => evict + notify
+    await adapter._sweep_pending_transfers(now=130.0)
+
+    # Evicted — no longer parked as a stranded transfer.
+    assert 9 not in adapter._pending_file_transfers
+    # User was notified on the originating chat (contactId 42).
+    assert adapter._last_sent[0] == "42"
+    assert "voice note" in adapter._last_sent[1]
+
+
