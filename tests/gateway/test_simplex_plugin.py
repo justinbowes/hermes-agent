@@ -644,3 +644,23 @@ async def test_contact_request_auto_accept_uses_websocket_api_command(monkeypatc
     )
 
     adapter._send_command.assert_awaited_once_with("/_accept 42")
+
+
+@pytest.mark.asyncio
+async def test_rcv_file_complete_unwraps_deferred_entry_and_injects_file_path():
+    """``_on_rcv_file_complete`` pops the wrapper entry, delivers the raw chat
+    item (not the {item, first_seen, retries} wrapper) to the handler with the
+    completed file path injected into it."""
+    adapter = _adapter_with_ws()
+    adapter._pending_file_transfers[9] = _deferred_entry(9, first_seen=100.0)
+    adapter._safe_handle_chat_item = AsyncMock()
+
+    await adapter._on_rcv_file_complete(
+        {"chatItem": {"chatItem": {"file": {"fileId": 9, "fileSource": {"filePath": "/tmp/note.ogg"}}}}}
+    )
+
+    adapter._safe_handle_chat_item.assert_awaited_once()
+    delivered = adapter._safe_handle_chat_item.await_args[0][0]
+    assert delivered["chatInfo"]["contact"]["contactId"] == 42  # raw item, not the wrapper
+    assert delivered["chatItem"]["file"]["fileSource"]["filePath"] == "/tmp/note.ogg"
+    assert 9 not in adapter._pending_file_transfers
